@@ -190,27 +190,41 @@ def _is_tie_point(current_props: Dict[str, Any], neighbor_props: Dict[str, Any])
     )
 
 
-def _find_start_node_from_t3(vaults_gj: Dict[str, Any], feature_nodes: Dict[int, List[Tuple[int,int]]]) -> Optional[Tuple[int,int]]:
+def _find_start_node_from_t3(
+    t3_gj: Dict[str, Any],
+    feature_nodes: Dict[int, List[Tuple[int,int]]]
+) -> Optional[Tuple[int,int]]:
     """
-    Try to find a 'T3' vault and snap it to the nearest node; else return None.
+    Use a dedicated T3 GeoJSON (Point feature(s)) to pick the start node.
+    We snap the FIRST T3 point we find to the nearest network node.
+
+    If no valid T3 point exists, return None (the caller will fall back).
     """
-    candidates = []
-    for _, vpt, vprops in _iter_points(vaults_gj):
-        blob = " ".join(str(vprops.get(k,"")) for k in ("Name","ID","Type","v_layer","Label"))
-        if "t3" in blob.lower():
-            candidates.append(vpt)
-    if not candidates:
+    # collect all T3 points
+    t3_pts: List[List[float]] = []
+    for f in t3_gj.get("features", []):
+        g = f.get("geometry") or {}
+        if g.get("type") == "Point" and isinstance(g.get("coordinates"), (list, tuple)) and len(g["coordinates"]) == 2:
+            t3_pts.append(g["coordinates"])
+
+    if not t3_pts:
         return None
-    # Pick the first T3 we find and snap to closest node
+
+    # all nodes in network
     all_nodes = []
     for nodes in feature_nodes.values():
         all_nodes.extend(nodes)
-    # de-duplicate
+    if not all_nodes:
+        return None
+    # de-dup
     all_nodes = list(dict.fromkeys(all_nodes))
-    # pick closest in feet
-    def _centroid(node_key):  # reconstruct approximate lon/lat from key
-        return [node_key[0]/1e7, node_key[1]/1e7]
-    t3 = candidates[0]
+
+    # centroid helper
+    def _centroid(nk: Tuple[int,int]) -> List[float]:
+        return [nk[0] / 1e7, nk[1] / 1e7]
+
+    # “You can pick any one” — just use the first T3 point
+    t3 = t3_pts[0]
     best = (float("inf"), None)
     for nk in all_nodes:
         d = distance_feet(t3, _centroid(nk))
@@ -229,29 +243,27 @@ def _build_l_linestring(a: Sequence[float], b: Sequence[float]) -> List[List[flo
 
 def _dfs_ordered_vaults(
     conduit_gj: Dict[str, Any],
-    vaults_gj: Dict[str, Any]
+    vaults_gj: Dict[str, Any],
+    t3_gj: Dict[str, Any]
 ) -> List[Tuple[int, List[float], Dict[str, Any]]]:
     """
     Traversal that:
-      • Walks Sections in order: Section 1..6, then unlabeled (None).
-      • Within the active Section, picks a chain start (endpoint if available).
-      • Continues along *same cable* first (same Section, Distribution Type, Conduit Type, Fiber Letter #1),
-        choosing the next feature that keeps the heading as straight as possible (min turn angle).
-      • At each junction, detours FIRST into tie-points (same Section but different cable),
-        then resumes the main cable.
-      • Emits vaults in the exact order we flow along features (not all-at-once).
+      • Walks Sections in order: Section 1..6, then unlabeled.
+      • Starts from the T3 coordinate (snapped to the nearest node) when possible.
+      • Within the active Section, continues along SAME CABLE first (same Section,
+        Distribution Type, Conduit Type, Fiber Letter #1) using a straightness rule
+        (min turn angle), and at junctions detours into tie-points first (same Section
+        but different cable).
+      • Emits vaults in the exact visit order.
     """
-    # --- Build topology and feature meta ---
     feature_nodes, node_to_features, feature_props, _ = _build_conduit_topology(conduit_gj)
     v_by_feature = _assign_vaults_to_features(conduit_gj, feature_nodes, vaults_gj)
     lines = {fid:(coords, props) for fid, coords, props in _iter_lines(conduit_gj)}
 
-    # quick helpers on nodes <-> lon/lat
     def _nk_to_xy(nk: Tuple[int,int]) -> List[float]:
         return [nk[0] / 1e7, nk[1] / 1e7]
 
     def _feature_along_vertices(fid: int) -> Tuple[List[List[float]], List[Tuple[int,int]], List[float]]:
-        """Return (coords, nodes, along_ft at each vertex)."""
         coords, _ = lines[fid]
         nodes = feature_nodes[fid]
         along = [0.0]
@@ -260,7 +272,6 @@ def _dfs_ordered_vaults(
             along.append(along[-1] + seg)
         return coords, nodes, along
 
-    # group features by Section label for ordered processing
     def _sec_norm(s: Optional[str]) -> Optional[str]:
         if s is None:
             return None
@@ -268,13 +279,10 @@ def _dfs_ordered_vaults(
         return s if s and s.lower() != "null" else None
 
     section_order = [f"Section {i}" for i in range(1,7)]
-    # Build: section -> set(fid)
     by_section: Dict[Optional[str], List[int]] = {}
     for fid in feature_nodes.keys():
         sec = _sec_norm(feature_props[fid].get("Section"))
         by_section.setdefault(sec, []).append(fid)
-
-    # ensure stable ordering inside lists
     for lst in by_section.values():
         lst.sort(key=lambda f: (str(feature_props[f].get("ID") or ""), f))
 
@@ -282,13 +290,10 @@ def _dfs_ordered_vaults(
     result: List[Tuple[int, List[float], Dict[str, Any]]] = []
 
     def _emit_vaults_until(fid: int, up_to_along_ft: float, v_state: Dict[int, int]):
-        """Emit vaults on this fid while their along<=up_to_along_ft (direction aware via v_state pointer)."""
         lst = v_by_feature.get(fid, [])
         if not lst:
             return
-        # Ensure list sorted by along
         lst = sorted(lst, key=lambda t: t[0])
-        # cursor state
         i = v_state.get(fid, 0)
         while i < len(lst) and lst[i][0] <= up_to_along_ft + 1e-6:
             _, vi, vpt, vprops = lst[i]
@@ -317,7 +322,6 @@ def _dfs_ordered_vaults(
             (pa.get("Fiber Letter #1") or "") == (pb.get("Fiber Letter #1") or "")
         )
 
-    # choose starts inside a section: prefer endpoints (nodes that touch only one feature from this section)
     def _section_endpoints(section_key: Optional[str]) -> List[Tuple[int, Tuple[int,int]]]:
         fids = [f for f in by_section.get(section_key, []) if f not in visited_fids]
         endpoints: List[Tuple[int, Tuple[int,int]]] = []
@@ -327,15 +331,12 @@ def _dfs_ordered_vaults(
             if not nodes:
                 continue
             for nk in (nodes[0], nodes[-1]):
-                # how many features of THIS section touch this node?
                 touching = [nf for nf in node_to_features.get(nk, set()) if nf in section_set]
                 if len(touching) == 1:
                     endpoints.append((fid, nk))
-        # stable ordering: leftmost->rightmost then bottom->top
-        endpoints.sort(key=lambda t: ( _nk_to_xy(t[1])[0], _nk_to_xy(t[1])[1] ))
+        endpoints.sort(key=lambda t: (_nk_to_xy(t[1])[0], _nk_to_xy(t[1])[1]))
         return endpoints
 
-    # find a predecessor heading vector for angle comparisons
     def _last_segment_vec(coords: List[List[float]], forward: bool) -> Tuple[float,float]:
         if forward:
             p1, p2 = coords[-2], coords[-1]
@@ -344,32 +345,26 @@ def _dfs_ordered_vaults(
         return _vec_meters(p1, p2)
 
     def _pick_next_same_cable(fid: int, tail_node: Tuple[int,int]) -> Optional[int]:
-        """Among neighbors at tail_node, choose SAME-CABLE feature that yields the straightest continuation."""
         candidates = [nf for nf in node_to_features.get(tail_node, set())
                       if nf != fid and nf not in visited_fids and _same_cable(fid, nf)]
         if not candidates:
             return None
-        # current direction vector at the tail of this feature:
         coords, _ = lines[fid]
         nodes = feature_nodes[fid]
-        forward = (nodes[-1] == tail_node)  # we are leaving from the end we just arrived at
+        forward = (nodes[-1] == tail_node)
         ax, ay = _last_segment_vec(coords, forward=True) if forward else _last_segment_vec(coords, forward=False)
 
         best = (float("inf"), None)
-        tail_xy = _nk_to_xy(tail_node)
         for nf in sorted(candidates, key=lambda f: (str(feature_props[f].get("ID") or ""), f)):
             ncoords, _ = lines[nf]
             nnodes = feature_nodes[nf]
-            # pick the first segment vector of nf leaving this node
             if nnodes[0] == tail_node and len(ncoords) >= 2:
                 bx, by = _vec_meters(ncoords[0], ncoords[1])
             elif nnodes[-1] == tail_node and len(ncoords) >= 2:
                 bx, by = _vec_meters(ncoords[-1], ncoords[-2])
             else:
-                # node is interior; pick whichever adjacent vertex exists
                 k = nnodes.index(tail_node)
                 if 0 < k < len(nnodes)-1:
-                    # prefer the forward part
                     bx, by = _vec_meters(_nk_to_xy(nnodes[k]), _nk_to_xy(nnodes[k+1]))
                 else:
                     continue
@@ -379,7 +374,6 @@ def _dfs_ordered_vaults(
         return best[1]
 
     def _walk_feature(fid: int, entry_node: Tuple[int,int], v_state: Dict[int,int]):
-        """Walk along one feature, vertex by vertex, interleaving tie-point detours and vault emission."""
         if fid in visited_fids:
             return
         visited_fids.add(fid)
@@ -388,97 +382,99 @@ def _dfs_ordered_vaults(
         nodes = feature_nodes[fid]
         props = feature_props[fid]
 
-        # align direction so nodes[0] == entry_node if possible
         if nodes and nodes[-1] == entry_node:
             nodes = list(reversed(nodes))
             coords = list(reversed(coords))
 
-        # precompute along per-vertex, and vaults along
         coords0, nodes0, along = _feature_along_vertices(fid)
-
-        # if reversed, recompute along on the reversed coords
         if nodes0[0] != nodes[0]:
             coords0 = list(reversed(coords0))
             nodes0  = list(reversed(nodes0))
-            # recompute along for reversed orientation
             along = [0.0]
             for i in range(1, len(coords0)):
                 along.append(along[-1] + distance_feet(coords0[i-1], coords0[i]))
-
-        # map: node_key -> along_ft at that vertex
         along_at_node = {nodes0[i]: along[i] for i in range(len(nodes0))}
 
-        # emit vaults as we pass each vertex, detouring into tie-points first
         for i, nk in enumerate(nodes):
-            # 1) emit vaults up to this vertex
             _emit_vaults_until(fid, along_at_node[nk], v_state)
-
-            # 2) handle tie-point branches at this junction (same Section, different cable)
             neighbor_fids = [nf for nf in node_to_features.get(nk, set()) if nf != fid and nf not in visited_fids]
             tie_neighbors = [nf for nf in neighbor_fids if _is_tie_point(props, feature_props[nf])]
             for nf in sorted(tie_neighbors, key=lambda f: (str(feature_props[f].get("ID") or ""), f)):
                 _walk_feature(nf, nk, v_state)
 
-        # at the tail, try to continue on SAME-CABLE first (straightest)
         tail = nodes[-1]
         next_same = _pick_next_same_cable(fid, tail)
         if next_same is not None:
             _walk_feature(next_same, tail, v_state)
 
-        # finally, flush any remaining vaults on this feature
         _emit_remaining_vaults(fid, v_state)
 
-    # --- master order over sections: 1..6, then unlabeled ---
+    # master order over sections
     sections_to_run: List[Optional[str]] = [s for s in section_order if s in by_section] + ([None] if None in by_section else [])
-    v_state: Dict[int,int] = {}  # per-feature vault cursor
+    v_state: Dict[int,int] = {}
 
     for sec in sections_to_run:
-        # walk all components in this section
+        # choose a start inside this section:
+        # If we can snap the T3 to a node that belongs to this section, use that first run.
+        # Otherwise, fall back to section endpoints, else any feature.
+        # 1) build set for quick membership
+        section_fids = set(f for f in by_section.get(sec, []) if f not in visited_fids)
+
+        if not section_fids:
+            continue
+
+        # Try T3
+        start_nk = _find_start_node_from_t3(t3_gj, feature_nodes)
+        start_fid = None
+        if start_nk is not None:
+            touching = [nf for nf in (node_to_features.get(start_nk, set()) or []) if nf in section_fids]
+            if touching:
+                # pick stable feature
+                start_fid = sorted(touching, key=lambda f: (str(feature_props[f].get("ID") or ""), f))[0]
+
         while True:
-            # pick an unvisited starting feature in this section
             candidates = [f for f in by_section.get(sec, []) if f not in visited_fids]
             if not candidates:
                 break
 
-            # prefer endpoints (true ends in this section); else fall back to any node
-            endpoints = _section_endpoints(sec)
-            start_fid, start_nk = None, None
-            for (fid, nk) in endpoints:
-                if fid in candidates:
-                    start_fid, start_nk = fid, nk
-                    break
             if start_fid is None:
-                # no endpoints; pick a stable feature and start at its first node
-                start_fid = sorted(candidates, key=lambda f: (str(feature_props[f].get("ID") or ""), f))[0]
-                start_nk = feature_nodes[start_fid][0]
+                endpoints = _section_endpoints(sec)
+                pick = None
+                for (fid, nk) in endpoints:
+                    if fid in candidates:
+                        pick = (fid, nk)
+                        break
+                if pick is None:
+                    fid = sorted(candidates, key=lambda f: (str(feature_props[f].get("ID") or ""), f))[0]
+                    nk = feature_nodes[fid][0]
+                    pick = (fid, nk)
+                start_fid, start_nk = pick
 
             _walk_feature(start_fid, start_nk, v_state)
+            start_fid = None  # subsequent components use regular picking
 
     return result
+
 
 
 
 def _propose_naps_and_drops(
     conduit_gj: Dict[str, Any],
     vaults_gj: Dict[str, Any],
-    sl_gj: Dict[str, Any]
+    sl_gj: Dict[str, Any],
+    t3_gj: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Revised siting that respects path order and tie-point branching.
-    We still:
-      - Place a NAP at a vault IF it serves at least one SL within 250' (L).
-      - Underground L-shaped drops; Aerial straight-only will be added later.
+    Siting that respects path order and tie-point branching, starting from T3 anchor.
+    Underground: L-shaped drops; (Aerial straight-only will be added later).
     """
-    ordered_vaults = _dfs_ordered_vaults(conduit_gj, vaults_gj)
+    ordered_vaults = _dfs_ordered_vaults(conduit_gj, vaults_gj, t3_gj)
     sl_points = _iter_points(sl_gj)
 
-    # Quick proximity index SLs→nearby vault (<=250' L)
     nap_features: List[Dict[str, Any]] = []
     drop_features: List[Dict[str, Any]] = []
 
-    # Build list of candidate SLs per vault (recomputed per vault for clarity)
     nap_counter = 0
-
     for vi, v_xy, v_props in ordered_vaults:
         nearby: List[Tuple[float, int, List[float], Dict[str, Any]]] = []
         for si, s_xy, s_props in sl_points:
@@ -486,7 +482,6 @@ def _propose_naps_and_drops(
             if dL <= MAX_L_DROP_FT:
                 nearby.append((dL, si, s_xy, s_props))
         if not nearby:
-            # Not every vault becomes a NAP; skip if no SLs
             continue
 
         nearby.sort(key=lambda x: x[0])
@@ -495,9 +490,8 @@ def _propose_naps_and_drops(
         nap_counter += 1
         nap_props = {
             "v_layer": "NAP (proposed)",
-            "Nap Location": "Underground",  # conduit implies UG; aerial logic later
-            "NAP # (proposed)": nap_counter,
-            # carry some vault context if present
+            "Nap Location": "Underground",
+            "NAP #": nap_counter,  # <— renamed
             "vault_id": _norm_val(v_props.get("ID")) or _norm_val(v_props.get("Name")),
         }
         nap_features.append({
@@ -511,7 +505,7 @@ def _propose_naps_and_drops(
                 "v_layer": "Fiber - Drop (draft)",
                 "Placement": "Underground",
                 "Distance (ft)": round(dL, 1),
-                "NAP # (proposed)": nap_counter,
+                "NAP #": nap_counter,  # <— renamed
                 "Service Location": s_props.get("Address") or s_props.get("Name") or s_props.get("ID"),
             }
             drop_features.append({
@@ -528,15 +522,18 @@ def _propose_naps_and_drops(
     return nap_fc, drop_fc
 
 
+
 def propose_naps_from_files(
     conduit_filename: str,
     vaults_filename: str,
     service_locations_filename: str,
+    t3_vault_filename: str,
     nap_out_name: str = "nap_proposed.geojson",
     drop_out_name: str = "fiber-drop_proposed.geojson"
 ) -> Tuple[str, str]:
     """
-    I/O wrapper (unchanged signature) — pass the **raw** conduit file if available.
+    I/O wrapper — now requires a T3 vault file to anchor traversal.
+    All paths are relative to modules.config.DATA_DIR.
     """
     base = config.DATA_DIR
     with open(os.path.join(base, conduit_filename), "r", encoding="utf-8") as f:
@@ -545,8 +542,10 @@ def propose_naps_from_files(
         vaults_gj = json.load(f)
     with open(os.path.join(base, service_locations_filename), "r", encoding="utf-8") as f:
         sl_gj = json.load(f)
+    with open(os.path.join(base, t3_vault_filename), "r", encoding="utf-8") as f:
+        t3_gj = json.load(f)
 
-    nap_fc, drop_fc = _propose_naps_and_drops(conduit_gj, vaults_gj, sl_gj)
+    nap_fc, drop_fc = _propose_naps_and_drops(conduit_gj, vaults_gj, sl_gj, t3_gj)
 
     nap_path = os.path.join(base, nap_out_name)
     drop_path = os.path.join(base, drop_out_name)
