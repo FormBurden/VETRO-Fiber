@@ -148,13 +148,46 @@ def _assign_vaults_to_features(
 
     return v_by_feature
 
+def _vec_meters(p1: Sequence[float], p2: Sequence[float]) -> Tuple[float, float]:
+    """Approx local-meter vector from p1->p2 using crude lat/lon scaling (good enough for angles)."""
+    lon1, lat1 = p1
+    lon2, lat2 = p2
+    lat_mid = (lat1 + lat2) / 2.0
+    # meters per degree
+    m_per_deg_lat = 111132.92 - 559.82 * math.cos(math.radians(2 * lat_mid)) + 1.175 * math.cos(math.radians(4 * lat_mid)) - 0.0023 * math.cos(math.radians(6 * lat_mid))
+    m_per_deg_lon = (111412.84 * math.cos(math.radians(lat_mid)) - 93.5 * math.cos(math.radians(3 * lat_mid)) + 0.118 * math.cos(math.radians(5 * lat_mid)))
+    return ((lon2 - lon1) * m_per_deg_lon, (lat2 - lat1) * m_per_deg_lat)
+
+def _angle_between(ax: float, ay: float, bx: float, by: float) -> float:
+    """Unsigned angle (radians) between 2 vectors a and b in meters-space."""
+    da = math.hypot(ax, ay)
+    db = math.hypot(bx, by)
+    if da == 0 or db == 0:
+        return math.pi  # worst case
+    dot = (ax * bx + ay * by) / (da * db)
+    dot = max(-1.0, min(1.0, dot))
+    return math.acos(dot)
+
+
 def _is_tie_point(current_props: Dict[str, Any], neighbor_props: Dict[str, Any]) -> bool:
     """
-    A neighbor is a 'Tie-Point' branch if EITHER Distribution Type OR Fiber Letter #1 differs.
-    Section and Conduit Type are carried along for context but don't trigger branching alone.
+    A neighbor is a 'Tie-Point' branch when it is in the SAME Section as the
+    current feature, but represents a different cable:
+      - Distribution Type differs OR
+      - Fiber Letter #1 differs OR
+      - Conduit Type differs
+
+    We only treat OTHER Sections as out-of-scope for the current pass; those are
+    traversed later when we move to their Section.
     """
-    return (current_props.get("Distribution Type") != neighbor_props.get("Distribution Type")) or \
-           (current_props.get("Fiber Letter #1")    != neighbor_props.get("Fiber Letter #1"))
+    if (current_props.get("Section") or "").lower() != (neighbor_props.get("Section") or "").lower():
+        return False  # different Section is not a tie-point detour now; will be walked later
+
+    return (
+        (current_props.get("Distribution Type") or "") != (neighbor_props.get("Distribution Type") or "")
+        or (current_props.get("Fiber Letter #1") or "") != (neighbor_props.get("Fiber Letter #1") or "")
+        or (current_props.get("Conduit Type") or "") != (neighbor_props.get("Conduit Type") or "")
+    )
 
 
 def _find_start_node_from_t3(vaults_gj: Dict[str, Any], feature_nodes: Dict[int, List[Tuple[int,int]]]) -> Optional[Tuple[int,int]]:
@@ -199,106 +232,230 @@ def _dfs_ordered_vaults(
     vaults_gj: Dict[str, Any]
 ) -> List[Tuple[int, List[float], Dict[str, Any]]]:
     """
-    Depth-first traversal starting at T3 (if present). At each node, detour into
-    Tie-Point branches (Distribution Type OR Fiber Letter #1 differs) *before*
-    continuing along the current feature. Returns a list of vault tuples in visit order.
+    Traversal that:
+      • Walks Sections in order: Section 1..6, then unlabeled (None).
+      • Within the active Section, picks a chain start (endpoint if available).
+      • Continues along *same cable* first (same Section, Distribution Type, Conduit Type, Fiber Letter #1),
+        choosing the next feature that keeps the heading as straight as possible (min turn angle).
+      • At each junction, detours FIRST into tie-points (same Section but different cable),
+        then resumes the main cable.
+      • Emits vaults in the exact order we flow along features (not all-at-once).
     """
+    # --- Build topology and feature meta ---
     feature_nodes, node_to_features, feature_props, _ = _build_conduit_topology(conduit_gj)
     v_by_feature = _assign_vaults_to_features(conduit_gj, feature_nodes, vaults_gj)
-
-    # Map feature -> its conduit coords (to know vertex ordering length)
     lines = {fid:(coords, props) for fid, coords, props in _iter_lines(conduit_gj)}
 
-    # Choose a start node: T3 if possible, else an endpoint node of any feature
-    start_node = _find_start_node_from_t3(vaults_gj, feature_nodes)
-    if start_node is None:
-        # pick any endpoint (node that belongs to exactly one feature or endpoint of a polyline)
-        endpoints = []
-        for fid, nodes in feature_nodes.items():
-            if nodes:
-                endpoints.extend([nodes[0], nodes[-1]])
-        start_node = endpoints[0] if endpoints else None
-    if start_node is None:
-        # nothing to traverse
-        ordered: List[Tuple[int, List[float], Dict[str, Any]]] = []
-        # still return vaults in any stable order to avoid empty output
-        for fid, lst in v_by_feature.items():
-            for _, vi, vpt, vprops in lst:
-                ordered.append((vi, vpt, vprops))
-        return ordered
+    # quick helpers on nodes <-> lon/lat
+    def _nk_to_xy(nk: Tuple[int,int]) -> List[float]:
+        return [nk[0] / 1e7, nk[1] / 1e7]
 
-    # Find a starting feature touching that node (pick any)
-    start_fid = next(iter(node_to_features.get(start_node, [])), None)
-    if start_fid is None:
-        # same fallback as above
-        ordered: List[Tuple[int, List[float], Dict[str, Any]]] = []
-        for fid, lst in v_by_feature.items():
-            for _, vi, vpt, vprops in lst:
-                ordered.append((vi, vpt, vprops))
-        return ordered
+    def _feature_along_vertices(fid: int) -> Tuple[List[List[float]], List[Tuple[int,int]], List[float]]:
+        """Return (coords, nodes, along_ft at each vertex)."""
+        coords, _ = lines[fid]
+        nodes = feature_nodes[fid]
+        along = [0.0]
+        for i in range(1, len(coords)):
+            seg = distance_feet(coords[i-1], coords[i])
+            along.append(along[-1] + seg)
+        return coords, nodes, along
+
+    # group features by Section label for ordered processing
+    def _sec_norm(s: Optional[str]) -> Optional[str]:
+        if s is None:
+            return None
+        s = s.strip()
+        return s if s and s.lower() != "null" else None
+
+    section_order = [f"Section {i}" for i in range(1,7)]
+    # Build: section -> set(fid)
+    by_section: Dict[Optional[str], List[int]] = {}
+    for fid in feature_nodes.keys():
+        sec = _sec_norm(feature_props[fid].get("Section"))
+        by_section.setdefault(sec, []).append(fid)
+
+    # ensure stable ordering inside lists
+    for lst in by_section.values():
+        lst.sort(key=lambda f: (str(feature_props[f].get("ID") or ""), f))
 
     visited_fids: set[int] = set()
     result: List[Tuple[int, List[float], Dict[str, Any]]] = []
 
-    def _emit_vaults_along(fid: int, forward: bool):
-        """Append vaults assigned to this feature in geometric order."""
+    def _emit_vaults_until(fid: int, up_to_along_ft: float, v_state: Dict[int, int]):
+        """Emit vaults on this fid while their along<=up_to_along_ft (direction aware via v_state pointer)."""
         lst = v_by_feature.get(fid, [])
         if not lst:
             return
-        items = lst if forward else list(reversed(lst))
-        for _, vi, vpt, vprops in items:
+        # Ensure list sorted by along
+        lst = sorted(lst, key=lambda t: t[0])
+        # cursor state
+        i = v_state.get(fid, 0)
+        while i < len(lst) and lst[i][0] <= up_to_along_ft + 1e-6:
+            _, vi, vpt, vprops = lst[i]
             result.append((vi, vpt, vprops))
+            i += 1
+        v_state[fid] = i
 
-    def _traverse(fid: int, entry_node: Tuple[int,int]):
+    def _emit_remaining_vaults(fid: int, v_state: Dict[int,int]):
+        lst = v_by_feature.get(fid, [])
+        if not lst:
+            return
+        lst = sorted(lst, key=lambda t: t[0])
+        i = v_state.get(fid, 0)
+        while i < len(lst):
+            _, vi, vpt, vprops = lst[i]
+            result.append((vi, vpt, vprops))
+            i += 1
+        v_state[fid] = i
+
+    def _same_cable(a: int, b: int) -> bool:
+        pa = feature_props[a]; pb = feature_props[b]
+        return (
+            (pa.get("Section") or "").lower() == (pb.get("Section") or "").lower() and
+            (pa.get("Distribution Type") or "") == (pb.get("Distribution Type") or "") and
+            (pa.get("Conduit Type") or "") == (pb.get("Conduit Type") or "") and
+            (pa.get("Fiber Letter #1") or "") == (pb.get("Fiber Letter #1") or "")
+        )
+
+    # choose starts inside a section: prefer endpoints (nodes that touch only one feature from this section)
+    def _section_endpoints(section_key: Optional[str]) -> List[Tuple[int, Tuple[int,int]]]:
+        fids = [f for f in by_section.get(section_key, []) if f not in visited_fids]
+        endpoints: List[Tuple[int, Tuple[int,int]]] = []
+        section_set = set(fids)
+        for fid in fids:
+            nodes = feature_nodes[fid]
+            if not nodes:
+                continue
+            for nk in (nodes[0], nodes[-1]):
+                # how many features of THIS section touch this node?
+                touching = [nf for nf in node_to_features.get(nk, set()) if nf in section_set]
+                if len(touching) == 1:
+                    endpoints.append((fid, nk))
+        # stable ordering: leftmost->rightmost then bottom->top
+        endpoints.sort(key=lambda t: ( _nk_to_xy(t[1])[0], _nk_to_xy(t[1])[1] ))
+        return endpoints
+
+    # find a predecessor heading vector for angle comparisons
+    def _last_segment_vec(coords: List[List[float]], forward: bool) -> Tuple[float,float]:
+        if forward:
+            p1, p2 = coords[-2], coords[-1]
+        else:
+            p1, p2 = coords[1], coords[0]
+        return _vec_meters(p1, p2)
+
+    def _pick_next_same_cable(fid: int, tail_node: Tuple[int,int]) -> Optional[int]:
+        """Among neighbors at tail_node, choose SAME-CABLE feature that yields the straightest continuation."""
+        candidates = [nf for nf in node_to_features.get(tail_node, set())
+                      if nf != fid and nf not in visited_fids and _same_cable(fid, nf)]
+        if not candidates:
+            return None
+        # current direction vector at the tail of this feature:
+        coords, _ = lines[fid]
+        nodes = feature_nodes[fid]
+        forward = (nodes[-1] == tail_node)  # we are leaving from the end we just arrived at
+        ax, ay = _last_segment_vec(coords, forward=True) if forward else _last_segment_vec(coords, forward=False)
+
+        best = (float("inf"), None)
+        tail_xy = _nk_to_xy(tail_node)
+        for nf in sorted(candidates, key=lambda f: (str(feature_props[f].get("ID") or ""), f)):
+            ncoords, _ = lines[nf]
+            nnodes = feature_nodes[nf]
+            # pick the first segment vector of nf leaving this node
+            if nnodes[0] == tail_node and len(ncoords) >= 2:
+                bx, by = _vec_meters(ncoords[0], ncoords[1])
+            elif nnodes[-1] == tail_node and len(ncoords) >= 2:
+                bx, by = _vec_meters(ncoords[-1], ncoords[-2])
+            else:
+                # node is interior; pick whichever adjacent vertex exists
+                k = nnodes.index(tail_node)
+                if 0 < k < len(nnodes)-1:
+                    # prefer the forward part
+                    bx, by = _vec_meters(_nk_to_xy(nnodes[k]), _nk_to_xy(nnodes[k+1]))
+                else:
+                    continue
+            ang = _angle_between(ax, ay, bx, by)
+            if ang < best[0]:
+                best = (ang, nf)
+        return best[1]
+
+    def _walk_feature(fid: int, entry_node: Tuple[int,int], v_state: Dict[int,int]):
+        """Walk along one feature, vertex by vertex, interleaving tie-point detours and vault emission."""
         if fid in visited_fids:
             return
         visited_fids.add(fid)
 
         coords, _ = lines[fid]
         nodes = feature_nodes[fid]
+        props = feature_props[fid]
 
-        # direction: make nodes[0] == entry_node if possible
-        forward = True
+        # align direction so nodes[0] == entry_node if possible
         if nodes and nodes[-1] == entry_node:
             nodes = list(reversed(nodes))
             coords = list(reversed(coords))
-            forward = True
-        # If entry_node not at either end (junction at interior vertex), keep forward=True and rely on vault alongs.
 
-        # Walk vertex by vertex
-        current_props = feature_props[fid]
+        # precompute along per-vertex, and vaults along
+        coords0, nodes0, along = _feature_along_vertices(fid)
 
-        # Emit vaults encountered on this feature first (in this feature's direction),
-        # but we will interleave DFS at each vertex prior to moving beyond it.
-        # For simplicity, emit all now, since we only need NAP ordering by feature visit order.
-        _emit_vaults_along(fid, forward=True)
+        # if reversed, recompute along on the reversed coords
+        if nodes0[0] != nodes[0]:
+            coords0 = list(reversed(coords0))
+            nodes0  = list(reversed(nodes0))
+            # recompute along for reversed orientation
+            along = [0.0]
+            for i in range(1, len(coords0)):
+                along.append(along[-1] + distance_feet(coords0[i-1], coords0[i]))
 
-        for nk in nodes:
+        # map: node_key -> along_ft at that vertex
+        along_at_node = {nodes0[i]: along[i] for i in range(len(nodes0))}
+
+        # emit vaults as we pass each vertex, detouring into tie-points first
+        for i, nk in enumerate(nodes):
+            # 1) emit vaults up to this vertex
+            _emit_vaults_until(fid, along_at_node[nk], v_state)
+
+            # 2) handle tie-point branches at this junction (same Section, different cable)
             neighbor_fids = [nf for nf in node_to_features.get(nk, set()) if nf != fid and nf not in visited_fids]
-            if not neighbor_fids:
-                continue
+            tie_neighbors = [nf for nf in neighbor_fids if _is_tie_point(props, feature_props[nf])]
+            for nf in sorted(tie_neighbors, key=lambda f: (str(feature_props[f].get("ID") or ""), f)):
+                _walk_feature(nf, nk, v_state)
 
-            # Split neighbors into tie-point vs same-path
-            tie_neighbors = []
-            same_neighbors = []
-            for nf in neighbor_fids:
-                if _is_tie_point(current_props, feature_props[nf]):
-                    tie_neighbors.append(nf)
-                else:
-                    same_neighbors.append(nf)
+        # at the tail, try to continue on SAME-CABLE first (straightest)
+        tail = nodes[-1]
+        next_same = _pick_next_same_cable(fid, tail)
+        if next_same is not None:
+            _walk_feature(next_same, tail, v_state)
 
-            # Detour into tie-points first
-            for nf in tie_neighbors:
-                _traverse(nf, nk)
+        # finally, flush any remaining vaults on this feature
+        _emit_remaining_vaults(fid, v_state)
 
-            # After tie-points, you *may* also have same-path splits; traverse them next.
-            for nf in same_neighbors:
-                _traverse(nf, nk)
+    # --- master order over sections: 1..6, then unlabeled ---
+    sections_to_run: List[Optional[str]] = [s for s in section_order if s in by_section] + ([None] if None in by_section else [])
+    v_state: Dict[int,int] = {}  # per-feature vault cursor
 
-        # end traverse
+    for sec in sections_to_run:
+        # walk all components in this section
+        while True:
+            # pick an unvisited starting feature in this section
+            candidates = [f for f in by_section.get(sec, []) if f not in visited_fids]
+            if not candidates:
+                break
 
-    _traverse(start_fid, start_node)
+            # prefer endpoints (true ends in this section); else fall back to any node
+            endpoints = _section_endpoints(sec)
+            start_fid, start_nk = None, None
+            for (fid, nk) in endpoints:
+                if fid in candidates:
+                    start_fid, start_nk = fid, nk
+                    break
+            if start_fid is None:
+                # no endpoints; pick a stable feature and start at its first node
+                start_fid = sorted(candidates, key=lambda f: (str(feature_props[f].get("ID") or ""), f))[0]
+                start_nk = feature_nodes[start_fid][0]
+
+            _walk_feature(start_fid, start_nk, v_state)
+
     return result
+
 
 
 def _propose_naps_and_drops(
