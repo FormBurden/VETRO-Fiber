@@ -449,24 +449,53 @@ def _dfs_ordered_vaults(
             nodes = list(reversed(nodes))
             coords = list(reversed(coords))
 
-        # along-from-start per vertex
+        # along-from-start per vertex (for vault emission)
         coords0, nodes0, along = _feature_along_vertices(fid)
         if nodes0[0] != nodes[0]:
-            coords0 = list(reversed(coords0))
-            nodes0  = list(reversed(nodes0))
-            along   = [0.0]
+            coords0  = list(reversed(coords0))
+            nodes0   = list(reversed(nodes0))
+            along    = [0.0]
             for i in range(1, len(coords0)):
                 along.append(along[-1] + distance_feet(coords0[i-1], coords0[i]))
         along_at_node = {nodes0[i]: along[i] for i in range(len(nodes0))}
 
+        # helper: distance from an XY to another feature's polyline (feet)
+        def _min_dist_to_feature(xy: List[float], other_fid: int) -> float:
+            ocoords, _ = lines[other_fid]
+            best = float("inf")
+            for i in range(1, len(ocoords)):
+                d = point_segment_distance_feet(xy, ocoords[i-1], ocoords[i])
+                if d < best:
+                    best = d
+            return best
+
+        # helper: neighbors at node nk including “snapped” mid-segment tees within NODE_SNAP_FT
+        def _neighbors_at_node(nk: Tuple[int,int]) -> List[int]:
+            xy = _nk_to_xy(nk)
+
+            # 1) True shared-vertex neighbors
+            shared = {nf for nf in node_to_features.get(nk, set())
+                    if nf != fid and nf not in visited_fids and _is_tie_neighbor(fid, nf)}
+
+            # 2) Snap-to-polyline neighbors (mid-segment tees in the SAME Section, not same cable)
+            same_section_fids = [nf for nf in by_section.get(_sec_norm(props.get("Section")), []) if nf != fid]
+            snapped = set()
+            for nf in same_section_fids:
+                if nf in visited_fids or _same_cable(fid, nf):
+                    continue
+                if _min_dist_to_feature(xy, nf) <= NODE_SNAP_FT:
+                    snapped.add(nf)
+
+            return list(shared | snapped)
+
         # traverse each vertex of this feature
         for nk in nodes:
-            # 1) Emit NAPs located up to this node first (junction gets numbered before detours)
+            # 1) Emit NAPs located up to this node first (junction numbered before detours)
             _emit_vaults_until(fid, along_at_node[nk], v_state)
 
             # 2) Build neighbor lists with Distribution-based priorities
-            neighbor_fids = [nf for nf in node_to_features.get(nk, set())
-                             if nf != fid and nf not in visited_fids and _is_tie_neighbor(fid, nf)]
+            neighbor_fids = _neighbors_at_node(nk)
+
             lowers, equal24, equal_non24, higher = [], [], [], []
             for nf in neighbor_fids:
                 ndist = _dist_num(feature_props[nf].get("Distribution Type"))
@@ -480,13 +509,19 @@ def _dfs_ordered_vaults(
                     higher.append(nf)
 
             # 3) Detour into LOWER first (smallest fiber count first)
-            for nf in sorted(lowers, key=lambda f: (_dist_num(feature_props[f].get("Distribution Type")),
-                                                    str(feature_props[f].get("ID") or ""), f)):
+            for nf in sorted(
+                lowers,
+                key=lambda f: (_dist_num(feature_props[f].get("Distribution Type")),
+                            str(feature_props[f].get("ID") or ""), f)
+            ):
                 _walk_feature(nf, nk, v_state)
 
             # 4) If CURRENT is 24ct, then detour equal-24 now (B -> A -> others)
-            for nf in sorted(equal24, key=lambda f: _letter_rank_for_equal24(feature_props[f].get("Fiber Letter #1")) +
-                                             (str(feature_props[f].get("ID") or ""),)):
+            for nf in sorted(
+                equal24,
+                key=lambda f: _letter_rank_for_equal24(feature_props[f].get("Fiber Letter #1"))
+                            + (str(feature_props[f].get("ID") or ""),)
+            ):
                 _walk_feature(nf, nk, v_state)
 
             # (We purposely do NOT walk equal_non24/higher at this point; they’re deferred.)
@@ -497,22 +532,34 @@ def _dfs_ordered_vaults(
         if next_same is not None:
             _walk_feature(next_same, tail, v_state)
 
-        # 6) After continuing the mainline, process any remaining same-Section ties we deferred
-        #    (equal_non24 first, then higher), using stable ordering.
-        for nk in (nodes[0], nodes[-1]):
-            neighbor_fids = [nf for nf in node_to_features.get(nk, set())
-                             if nf != fid and nf not in visited_fids and _is_tie_neighbor(fid, nf)]
-            # re-partition with current feature's dist
-            en24 = [nf for nf in neighbor_fids if _dist_num(feature_props[nf].get("Distribution Type")) == cur_dist != 24]
-            hi   = [nf for nf in neighbor_fids if _dist_num(feature_props[nf].get("Distribution Type")) > cur_dist]
-            for nf in sorted(en24, key=lambda f: (str(feature_props[f].get("Fiber Letter #1") or ""), str(feature_props[f].get("ID") or ""), f)):
-                _walk_feature(nf, nk, v_state)
-            for nf in sorted(hi, key=lambda f: (-_dist_num(feature_props[f].get("Distribution Type")),
-                                                str(feature_props[f].get("Fiber Letter #1") or ""), str(feature_props[f].get("ID") or ""), f)):
-                _walk_feature(nf, nk, v_state)
+    # 6) After continuing the mainline, process any remaining same-Section ties we deferred
+    #    (equal_non24 first, then higher) — include snapped mid-segment neighbors at endpoints.
+    for nk in (nodes[0], nodes[-1]):
+        neighbor_fids = _neighbors_at_node(nk)
 
-        # 7) trailing NAPs on this feature
-        _emit_remaining_vaults(fid, v_state)
+        en24 = [nf for nf in neighbor_fids
+                if _dist_num(feature_props[nf].get("Distribution Type")) == cur_dist != 24]
+        hi   = [nf for nf in neighbor_fids
+                if _dist_num(feature_props[nf].get("Distribution Type"))  > cur_dist]
+
+        for nf in sorted(
+            en24,
+            key=lambda f: (str(feature_props[f].get("Fiber Letter #1") or ""),
+                           str(feature_props[f].get("ID") or ""), f)
+        ):
+            _walk_feature(nf, nk, v_state)
+
+        for nf in sorted(
+            hi,
+            key=lambda f: (-_dist_num(feature_props[f].get("Distribution Type")),
+                           str(feature_props[f].get("Fiber Letter #1") or ""),
+                           str(feature_props[f].get("ID") or ""), f)
+        ):
+            _walk_feature(nf, nk, v_state)
+
+    # 7) trailing NAPs on this feature
+    _emit_remaining_vaults(fid, v_state)
+
 
     # master Section order
     sections_to_run: List[Optional[str]] = [s for s in section_order if s in by_section] + ([None] if None in by_section else [])
