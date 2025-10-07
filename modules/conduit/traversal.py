@@ -92,82 +92,105 @@ def dfs_ordered_vaults(
             along.append(along[-1] + seg)
         return coords, nodes, along
 
-    def _neighbor_rank(
-        current_fid: int,
-        prev_node_xy: Optional[List[float]],
-        at_node_xy: List[float],
-        candidate_fid: int,
-        is_start: bool
-    ) -> tuple:
+    # PLACE THIS HELPER INSIDE dfs_ordered_vaults, near other locals
+
+    def _neighbor_rank(current_fid: int,
+                    came_from_xy: Optional[List[float]],
+                    at_xy: List[float],
+                    nb_fid: int,
+                    is_start_node: bool) -> Tuple:
         """
-        Sort key for neighbor selection.
+        Rank neighbors according to your field rules:
 
-        Category order (lower sorts first):
-          0) START PICK ONLY: highest Distribution first (reverse)  [applies when is_start=True]
-          1) Lower Distribution detours (smaller fiber count first)
-          2) (current is 24ct) equal-24 detours in order B -> A -> others
-          3) Continue along SAME CABLE using straightest turn (smaller angle first)
-          4) Remaining same-Section ties: equal_non24 first, then higher
-          5) Everything else
+        1) Immediately after arriving at a node: we will emit NAPs first (handled elsewhere).
+        2) Detour preference:
+        • LOWER Distribution first (smaller fiber count first).
+        • If CURRENT is 24ct, also detour equal-24 now in order: B → A → others.
+        3) Continue SAME CABLE (Section+Distribution+Letter#1) with straightest turn.
+        4) Remaining ties by section order and then ID for stability.
 
-        Angle is the unsigned angle between incoming and outgoing vectors (smaller is straighter).
+        We encode this as a sortable key (smaller = higher priority).
         """
         pa = feature_props[current_fid]
-        pb = feature_props[candidate_fid]
+        pb = feature_props[nb_fid]
 
-        dist_a = _dist_num(pa.get("Distribution Type"))
-        dist_b = _dist_num(pb.get("Distribution Type"))
+        cur_dist = _dist_num(pa.get("Distribution Type"))
+        nb_dist  = _dist_num(pb.get("Distribution Type"))
 
-        sec_a = (pa.get("Section") or "").strip().lower()
-        sec_b = (pb.get("Section") or "").strip().lower()
+        cur_letter = (pa.get("Fiber Letter #1") or "").strip().upper()
+        nb_letter  = (pb.get("Fiber Letter #1") or "").strip().upper()
 
-        let_b = (pb.get("Fiber Letter #1") or "").strip().upper()
+        same_line = _same_cable(current_fid, nb_fid)
 
-        # default angle if we can't compute
-        angle = 180.0
-        if prev_node_xy is not None:
-            coords_b, nodes_b, _ = _feature_along_vertices(candidate_fid)
-            if coords_b and (coords_b[0] == at_node_xy or coords_b[-1] == at_node_xy):
-                next_xy = coords_b[1] if coords_b[0] == at_node_xy and len(coords_b) > 1 else (
-                          coords_b[-2] if coords_b[-1] == at_node_xy and len(coords_b) > 1 else at_node_xy)
+        # Section bucket (stable final tie-breaker)
+        sec = _sec_norm(pb.get("Section"))
+        try:
+            sec_bucket = section_order.index(sec) if sec in section_order else len(section_order)
+        except Exception:
+            sec_bucket = len(section_order)
+
+        # Straightness (prefer straighter)
+        # If we don't have a previous direction vector, set a neutral angle.
+        if came_from_xy is not None:
+            ax, ay = _vec_meters(came_from_xy, at_xy)
+        else:
+            ax, ay = (0.0, 1.0)  # arbitrary "up" to keep key consistent
+
+        # nb direction: from node (at_xy) toward the first vertex of nb feature away from the node
+        nb_coords, nb_nodes, _ = _feature_along_vertices(nb_fid)
+        # pick the endpoint in nb_coords that is farther from at_xy to define the outgoing vector
+        if distance_feet(at_xy, nb_coords[0]) < distance_feet(at_xy, nb_coords[-1]):
+            bx, by = _vec_meters(at_xy, nb_coords[-1])
+        else:
+            bx, by = _vec_meters(at_xy, nb_coords[0])
+        angle = _angle_between(ax, ay, bx, by)
+
+        # Priority layers:
+
+        # A) SAME CABLE continuation should generally be preferred after required detours
+        same_line_flag = 0 if same_line else 1
+
+        # B) Detours: lower distribution first
+        # encode as: lower nb_dist → smaller key
+        lower_dist_key = nb_dist
+
+        # C) Special 24ct equal handling when current is 24:
+        # if equal 24: B first, then A, then others
+        equal24_order = 9  # default high
+        if cur_dist == 24 and nb_dist == 24:
+            if nb_letter == "B":
+                equal24_order = 0
+            elif nb_letter == "A":
+                equal24_order = 1
             else:
-                if coords_b:
-                    d0 = distance_feet(coords_b[0], at_node_xy)
-                    d1 = distance_feet(coords_b[-1], at_node_xy)
-                    next_xy = coords_b[0] if d0 < d1 else coords_b[-1]
-                else:
-                    next_xy = at_node_xy
+                equal24_order = 2
 
-            ax, ay = _vec_meters(prev_node_xy, at_node_xy)
-            bx, by = _vec_meters(at_node_xy, next_xy)
-            angle = _angle_between(ax, ay, bx, by)
+        # D) Straightness (smaller angle is straighter)
+        straight_key = angle
 
-        if is_start:
-            let_order = 0 if (pb.get("Fiber Letter #1") or "").strip().upper() == "A" else 1
-            return (0, -dist_b, let_order, angle)
+        # E) Final tie-breakers
+        id_key = str(pb.get("ID") or "")
 
-        if dist_b < dist_a:
-            return (1, dist_b, angle)
+        # Build the rank tuple. The ordering logic is:
+        #   - Prefer required detours (lower dist) before same-line continuation,
+        #     but if both are same-line, straightness wins.
+        #
+        # We do this by making a composite that first prefers lower distribution,
+        # then (only among equals) prefer equal-24 ordering, then whether it's same-line,
+        # then straightness, then section bucket, then ID.
+        #
+        # Note: is_start_node can be used if you want to tweak behavior at the very first step
+        # (e.g., prefer highest dist at start as you specified elsewhere), but our start-fid
+        # choice already handles that so we keep the same ranking here.
+        return (
+            lower_dist_key,       # lower first
+            equal24_order,        # 24ct B→A→others when equal 24
+            same_line_flag,       # same line earlier
+            straight_key,         # straighter earlier
+            sec_bucket,           # section stability
+            id_key,               # id stability
+        )
 
-        if dist_a == 24 and dist_b == 24:
-            letter_rank = 2
-            if let_b == "B":
-                letter_rank = 0
-            elif let_b == "A":
-                letter_rank = 1
-            return (2, letter_rank, angle)
-
-        if _same_cable(current_fid, candidate_fid):
-            return (3, angle)
-
-        if sec_a == sec_b:
-            if dist_b == dist_a and dist_a != 24:
-                let_order = 0 if let_b == "A" else 1
-                return (4, 0, let_order, angle)
-            if dist_b > dist_a:
-                return (4, 1, dist_b, angle)
-
-        return (5, dist_b, angle)
 
     # ----- helpers to anchor at T3 -----
     def _find_start_node_from_t3(
@@ -419,121 +442,95 @@ def dfs_ordered_vaults(
 
     v_state: Dict[int, int] = {}
 
-    def _walk_feature(fid: int, entry_node: Tuple[int, int]):
+
+    def _walk_feature(fid: int,
+                    enter_node: Tuple[int, int],
+                    came_from_xy: Optional[List[float]],
+                    v_state: Dict[int, int]) -> None:
+        """
+        Walk a single feature from the node we just entered.
+        Critical fixes:
+        • Set orientation so we walk AWAY from the junction (tie-point rule).
+        • Immediately EMIT vaults/NAPs at this node BEFORE any branch traversal.
+        • At every subsequent node along this feature, emit the vault(s) at that node first,
+            then consider neighbor features in the _neighbor_rank() order.
+        """
         if fid in visited_fids:
             return
         visited_fids.add(fid)
 
-        coords, _ = lines[fid]
-        nodes = feature_nodes[fid]
-        props = feature_props[fid]
-        cur_dist = _dist_num(props.get("Distribution Type"))
+        coords, nodes, along = _feature_along_vertices(fid)
 
-        flip = bool(nodes and nodes[-1] == entry_node)
+        # Find which vertex/segment matches the enter_node; choose direction AWAY from it.
+        # nodes is a list of node-keys per vertex; locate matching index.
+        try:
+            enter_idx = nodes.index(enter_node)
+        except ValueError:
+            # If we can't find it (shouldn't happen), pick the closer endpoint by distance.
+            d0 = distance_feet(_nk_to_xy(nodes[0]), _nk_to_xy(enter_node))
+            d1 = distance_feet(_nk_to_xy(nodes[-1]), _nk_to_xy(enter_node))
+            enter_idx = 0 if d0 < d1 else (len(nodes) - 1)
 
-        if not hasattr(_emit_vaults_until, "flip"):
-            _emit_vaults_until.flip = {}
-        _emit_vaults_until.flip[fid] = flip
+        # Orientation: if we entered at head (index 0), we go forward; if at tail (last), we go backward.
+        go_forward = (enter_idx == 0)
+        # If we entered somewhere in the middle (rare), pick the side that increases distance from the entry.
+        if 0 < enter_idx < (len(nodes) - 1):
+            # compare remaining length forward vs backward; choose the longer (towards cable "end")
+            remain_fwd = along[-1] - along[enter_idx]
+            remain_back = along[enter_idx]
+            go_forward = remain_fwd >= remain_back
 
-        if not hasattr(_emit_vaults_until, "total"):
-            _emit_vaults_until.total = {}
-        if fid not in _emit_vaults_until.total:
-            tl = 0.0
-            for i in range(1, len(coords)):
-                tl += distance_feet(coords[i - 1], coords[i])
-            _emit_vaults_until.total[fid] = tl
+        # Record flip meta for _emit_vaults_until/_emit_remaining_vaults
+        flip_map = getattr(_emit_vaults_until, "flip", {})
+        flip_map = dict(flip_map)
+        flip_map[fid] = (not go_forward)  # flipped if we are walking tail→head
+        _emit_vaults_until.flip = flip_map
 
-        along_orig = [0.0]
-        for i in range(1, len(coords)):
-            along_orig.append(along_orig[-1] + distance_feet(coords[i - 1], coords[i]))
-        total_len = along_orig[-1] if along_orig else 0.0
+        # Emit vault(s) AT THE ENTRY NODE immediately (up_to_along=0 in oriented space).
+        _emit_vaults_until(fid, 0.0, v_state)
 
-        along_at_node_orig = {nodes[i]: along_orig[i] for i in range(len(nodes))}
-        if not flip:
-            along_at_node = along_at_node_orig
+        # Start walking along this feature, vertex by vertex, in the chosen direction.
+        if go_forward:
+            vertex_iter = range(enter_idx + 1, len(nodes))
+            prev_xy = coords[enter_idx]
         else:
-            along_at_node = {nk: (total_len - a) for nk, a in along_at_node_orig.items()}
+            vertex_iter = range(enter_idx - 1, -1, -1)
+            prev_xy = coords[enter_idx]
 
-        prev_xy: Optional[List[float]] = None
-        for nk in nodes:
-            _emit_vaults_until(fid, along_at_node[nk], v_state)
+        for vi in vertex_iter:
+            cur_xy = coords[vi]
+            # Compute oriented distance “so far” on this feature
+            oriented_along = along[vi] if go_forward else (along[-1] - along[vi])
+            # Emit all vaults up to this oriented position (this includes node-coincident vaults)
+            _emit_vaults_until(fid, oriented_along, v_state)
 
-            at_xy = _nk_to_xy(nk)
-            is_start = bool(start_pair and fid == start_pair[0] and nk == start_pair[1])
+            # At this node, consider neighbor features (branches) BEFORE continuing.
+            nk = nodes[vi]
+            touching = [tfid for tfid in node_to_features.get(nk, []) if tfid != fid]
 
-            neighbor_fids = _neighbors_at_node(fid, nk)
-            neighbors = list(neighbor_fids)
-            neighbors.sort(
-                key=lambda fid2: _neighbor_rank(fid, prev_xy, at_xy, fid2, is_start)
-            )
-            neighbor_fids = neighbors
+            if touching:
+                # Order neighbors per rules.
+                is_start_node = (came_from_xy is None)
+                at_xy = cur_xy
+                neighbors = list(touching)
+                neighbors.sort(
+                    key=lambda nb: _neighbor_rank(fid, came_from_xy, at_xy, nb, is_start_node)
+                )
 
-            lowers: List[int] = []
-            equal24: List[int] = []
-            equal_non24: List[int] = []
-            higher: List[int] = []
-            for nf in neighbor_fids:
-                ndist = _dist_num(feature_props[nf].get("Distribution Type"))
-                if ndist < cur_dist:
-                    lowers.append(nf)
-                elif ndist == cur_dist == 24:
-                    equal24.append(nf)
-                elif ndist == cur_dist:
-                    equal_non24.append(nf)
-                else:
-                    higher.append(nf)
+                # Depth-first into neighbors in ranked order.
+                for nb in neighbors:
+                    if nb in visited_fids:
+                        continue
+                    # WALK the neighbor, entering at this same node “nk”.
+                    _walk_feature(nb, nk, at_xy, v_state)
 
-            for nf in sorted(
-                lowers,
-                key=lambda f: (_dist_num(feature_props[f].get("Distribution Type")), str(feature_props[f].get("ID") or ""), f),
-            ):
-                _walk_feature(nf, nk)
+            # update prev direction for straightness calc on subsequent steps
+            came_from_xy = prev_xy
+            prev_xy = cur_xy
 
-            def _letter_rank_for_equal24(letter: str) -> Tuple[int, str]:
-                L = (letter or "").strip().upper()
-                if L == "B":
-                    return (0, L)
-                if L == "A":
-                    return (1, L)
-                return (2, L)
+        # At the end of this feature, emit any remaining vaults (safety).
+        _emit_remaining_vaults(fid, v_state)
 
-            for nf in sorted(
-                equal24,
-                key=lambda f: _letter_rank_for_equal24(feature_props[f].get("Fiber Letter #1")) + (str(feature_props[f].get("ID") or ""),),
-            ):
-                _walk_feature(nf, nk)
-
-            # Continue along SAME CABLE from the tail (straightest turn)
-            tail = nodes[-1] if not flip else nodes[0]
-            next_same = _pick_next_same_cable(fid, tail)
-            if next_same is not None:
-                _walk_feature(next_same, tail)
-
-            # Deferred same-Section ties at endpoints
-            for nk2 in (nodes[0], nodes[-1]):
-                neighbor_fids2 = _neighbors_at_node(fid, nk2)
-                en24 = [nf for nf in neighbor_fids2 if _dist_num(feature_props[nf].get("Distribution Type")) == cur_dist != 24]
-                hi = [nf for nf in neighbor_fids2 if _dist_num(feature_props[nf].get("Distribution Type")) > cur_dist]
-
-                for nf in sorted(
-                    en24,
-                    key=lambda f: (str(feature_props[f].get("Fiber Letter #1") or ""), str(feature_props[f].get("ID") or ""), f),
-                ):
-                    _walk_feature(nf, nk2)
-
-                for nf in sorted(
-                    hi,
-                    key=lambda f: (
-                        -_dist_num(feature_props[f].get("Distribution Type")),
-                        str(feature_props[f].get("Fiber Letter #1") or ""),
-                        str(feature_props[f].get("ID") or ""),
-                        f,
-                    ),
-                ):
-                    _walk_feature(nf, nk2)
-
-            _emit_remaining_vaults(fid, v_state)
-            prev_xy = at_xy
 
     # ===== Master traversal order, T3-anchored =====
     start_nk = _find_start_node_from_t3(t3_gj, feature_nodes)
