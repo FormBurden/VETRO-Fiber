@@ -1,7 +1,8 @@
 # modules/conduit/traversal.py
 from __future__ import annotations
 
-import math, re
+import math
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from modules.geo.geometry import distance_feet, point_segment_distance_feet
@@ -16,6 +17,7 @@ NODE_SNAP_FT = 20.0
 
 
 def _vec_meters(p1: Sequence[float], p2: Sequence[float]) -> Tuple[float, float]:
+    """Approx local-meter vector from p1->p2 using crude lat/lon scaling; good enough for angles."""
     lon1, lat1 = p1
     lon2, lat2 = p2
     lat_mid = (lat1 + lat2) / 2.0
@@ -34,6 +36,7 @@ def _vec_meters(p1: Sequence[float], p2: Sequence[float]) -> Tuple[float, float]
 
 
 def _angle_between(ax: float, ay: float, bx: float, by: float) -> float:
+    """Unsigned angle (degrees) between two meter-space vectors."""
     da = math.hypot(ax, ay) or 1e-9
     db = math.hypot(bx, by) or 1e-9
     cosv = max(-1.0, min(1.0, (ax * bx + ay * by) / (da * db)))
@@ -60,16 +63,16 @@ def dfs_ordered_vaults(
     t3_gj: Dict[str, Any],
 ) -> List[Tuple[int, List[float], Dict[str, Any]]]:
     """
-    Traversal implementing your rules:
+    Depth-first traversal of the conduit network producing vaults in the field rule order.
 
     Start at T3:
       • Pick touching conduit with HIGHEST Distribution Type (72 > 48 > 24).
       • If tied, prefer Fiber Letter #1 = 'A' first, then alphabetical.
 
     At each visited node (depth-first):
-      1) Emit any NAP at this node.
+      1) Emit any NAP located at this node (junction first).
       2) Detour into LOWER Distribution branches first (smaller fiber count first).
-      3) If CURRENT is 24ct, also detour equal-24 now (B → A → others).
+      3) If CURRENT is 24ct, also detour equal-24 now in order B → A → others.
       4) Continue along SAME CABLE (same Section/Distribution/ConduitType/Letter#1) using straightest turn.
       5) Finally, process remaining same-Section ties (equal_non24, then higher).
     """
@@ -143,6 +146,8 @@ def dfs_ordered_vaults(
         dist_eq = _dist_num(pa.get("Distribution Type")) == _dist_num(pb.get("Distribution Type"))
         let_a = (pa.get("Fiber Letter #1") or "").strip().upper()
         let_b = (pb.get("Fiber Letter #1") or "").strip().upper()
+        # SAME line if Section + Distribution match; if letters exist on both and match, good.
+        # If letters missing on either side, still same line. Conduit Type differences are ignored here.
         return sec_eq and dist_eq and (let_a == let_b or not (let_a and let_b))
 
     def _last_seg_vec(coords: List[List[float]], forward: bool) -> Tuple[float, float]:
@@ -174,9 +179,13 @@ def dfs_ordered_vaults(
             elif nnodes[-1] == tail_node and len(ncoords) >= 2:
                 bx, by = _vec_meters(ncoords[-1], ncoords[-2])
             else:
-                k = nnodes.index(tail_node)
-                if 0 < k < len(nnodes) - 1:
-                    bx, by = _vec_meters(_nk_to_xy(nnodes[k]), _nk_to_xy(nnodes[k + 1]))
+                # If tail node is interior to nf, approximate leaving direction along next vertex
+                if tail_node in nnodes:
+                    k = nnodes.index(tail_node)
+                    if 0 < k < len(nnodes) - 1:
+                        bx, by = _vec_meters(_nk_to_xy(nnodes[k]), _nk_to_xy(nnodes[k + 1]))
+                    else:
+                        continue
                 else:
                     continue
             ang = _angle_between(ax, ay, bx, by)
@@ -194,9 +203,10 @@ def dfs_ordered_vaults(
         return best
 
     def _neighbors_at_node(fid: int, nk: Tuple[int, int]) -> List[int]:
+        """Neighbors at a node in the same Section but different cable; includes snapped tees within NODE_SNAP_FT."""
         props = feature_props[fid]
         xy = _nk_to_xy(nk)
-        # true shared-vertex neighbors in same Section but different cable
+        # true shared-vertex neighbors
         shared = {
             nf
             for nf in (node_to_features.get(nk, set()) or set())
@@ -234,11 +244,12 @@ def dfs_ordered_vaults(
         props = feature_props[fid]
         cur_dist = _dist_num(props.get("Distribution Type"))
 
-        # orient from entry_node
+        # orient from entry_node toward the far end
         if nodes and nodes[-1] == entry_node:
             nodes = list(reversed(nodes))
             coords = list(reversed(coords))
 
+        # along-from-start per vertex (for vault emission)
         coords0, nodes0, along = _feature_along_vertices(fid)
         if nodes0[0] != nodes[0]:
             coords0 = list(reversed(coords0))
@@ -248,11 +259,17 @@ def dfs_ordered_vaults(
                 along.append(along[-1] + distance_feet(coords0[i - 1], coords0[i]))
         along_at_node = {nodes0[i]: along[i] for i in range(len(nodes0))}
 
+        # traverse each vertex on this feature
         for nk in nodes:
+            # 1) NAPs up to this node
             _emit_vaults_until(fid, along_at_node[nk], v_state)
 
+            # 2) detours based on neighbor distribution
             neighbor_fids = _neighbors_at_node(fid, nk)
-            lowers, equal24, equal_non24, higher = [], [], [], []
+            lowers: List[int] = []
+            equal24: List[int] = []
+            equal_non24: List[int] = []
+            higher: List[int] = []
             for nf in neighbor_fids:
                 ndist = _dist_num(feature_props[nf].get("Distribution Type"))
                 if ndist < cur_dist:
@@ -264,42 +281,65 @@ def dfs_ordered_vaults(
                 else:
                     higher.append(nf)
 
-            for nf in sorted(lowers, key=lambda f: (_dist_num(feature_props[f].get("Distribution Type")), str(feature_props[f].get("ID") or ""), f)):
+            # 3) LOWER Distribution branches (smaller fiber count first)
+            for nf in sorted(
+                lowers,
+                key=lambda f: (_dist_num(feature_props[f].get("Distribution Type")), str(feature_props[f].get("ID") or ""), f),
+            ):
                 _walk_feature(nf, nk)
 
-            for nf in sorted(equal24, key=lambda f: _letter_rank_for_equal24(feature_props[f].get("Fiber Letter #1")) + (str(feature_props[f].get("ID") or ""),)):
+            # 4) If current is 24ct, detour equal-24 now (B → A → others)
+            for nf in sorted(
+                equal24,
+                key=lambda f: _letter_rank_for_equal24(feature_props[f].get("Fiber Letter #1")) + (str(feature_props[f].get("ID") or ""),),
+            ):
                 _walk_feature(nf, nk)
 
+            # 5) Continue along SAME CABLE (straightest turn from tail)
             tail = nodes[-1]
             next_same = _pick_next_same_cable(fid, tail)
             if next_same is not None:
                 _walk_feature(next_same, tail)
 
-        # deferred same-Section ties at endpoints
+        # 6) After mainline, process deferred same-Section ties at endpoints
         for nk in (nodes[0], nodes[-1]):
             neighbor_fids = _neighbors_at_node(fid, nk)
             en24 = [nf for nf in neighbor_fids if _dist_num(feature_props[nf].get("Distribution Type")) == cur_dist != 24]
             hi = [nf for nf in neighbor_fids if _dist_num(feature_props[nf].get("Distribution Type")) > cur_dist]
 
-            for nf in sorted(en24, key=lambda f: (str(feature_props[f].get("Fiber Letter #1") or ""), str(feature_props[f].get("ID") or ""), f)):
+            for nf in sorted(
+                en24,
+                key=lambda f: (str(feature_props[f].get("Fiber Letter #1") or ""), str(feature_props[f].get("ID") or ""), f),
+            ):
                 _walk_feature(nf, nk)
 
-            for nf in sorted(hi, key=lambda f: (-_dist_num(feature_props[f].get("Distribution Type")), str(feature_props[f].get("Fiber Letter #1") or ""), str(feature_props[f].get("ID") or ""), f)):
+            for nf in sorted(
+                hi,
+                key=lambda f: (
+                    -_dist_num(feature_props[f].get("Distribution Type")),
+                    str(feature_props[f].get("Fiber Letter #1") or ""),
+                    str(feature_props[f].get("ID") or ""),
+                    f,
+                ),
+            ):
                 _walk_feature(nf, nk)
 
+        # 7) trailing NAPs on this feature
         _emit_remaining_vaults(fid, v_state)
 
-    # master per-Section walk
-    sections_to_run: List[Optional[str]] = [s for s in section_order if s in by_section] + ([None] if None in by_section else [])
+    # master Section iteration (ordered Section 1..6 first, then any None/others)
+    sections_to_run: List[Optional[str]] = [s for s in section_order if s in by_section] + (
+        [None] if None in by_section else []
+    )
     for sec in sections_to_run:
-        if not any(f not in visited_fids for f in (by_section.get(sec, []) or [])):
-            continue
-        # choose a start feature in this Section: prefer an endpoint, else the first unvisited
-        candidates = [f for f in (by_section.get(sec, []) or []) if f not in visited_fids]
-        if not candidates:
-            continue
-        fid0 = candidates[0]
-        nk0 = feature_nodes[fid0][0]
-        _walk_feature(fid0, nk0)
+        # walk all connected components in this Section
+        while True:
+            candidates = [f for f in (by_section.get(sec, []) or []) if f not in visited_fids]
+            if not candidates:
+                break
+            # Prefer an endpoint start if available; otherwise first remaining
+            fid0 = candidates[0]
+            nk0 = feature_nodes[fid0][0]
+            _walk_feature(fid0, nk0)
 
     return result
