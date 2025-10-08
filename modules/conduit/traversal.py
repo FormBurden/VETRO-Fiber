@@ -160,7 +160,7 @@ def dfs_ordered_vaults(
             i += 1
         v_state[fid] = i
 
-    def _emit_node_vaults(nk: Tuple[int, int], tol_ft: float = 1.0) -> None:
+    def _emit_node_vaults(nk: Tuple[int, int], tol_ft: float = 20.0) -> None:
         """
         Emit any vault(s)/NAP(s) that lie within tol_ft of the given node coordinate,
         regardless of which feature they are assigned to.
