@@ -401,10 +401,6 @@ def dfs_ordered_vaults(
 
     start_nk = _find_start_node_from_t3(t3_gj, feature_nodes)
 
-    # Emit any node-coincident NAP(s) at the T3 node before walking
-    if start_nk is not None:
-        _emit_node_vaults(start_nk, tol_ft=20.0)
-
     # Build initial starts strictly by Section number at T3: 1, then 2, then 3, ...
     start_fids_ordered: List[int] = []
     if start_nk is not None:
@@ -420,23 +416,19 @@ def dfs_ordered_vaults(
             # Build ordered list: smallest section number to largest
             for sn in sorted(sec_to_fids.keys()):
                 # Deterministic order within a Section at T3:
-                # **LOWER Distribution first**, then 24-specific letter rule (B > A), otherwise A-first; then ID.
+                # **HIGHER Distribution first** (72 > 48 > 24), then letter 'A' first, then alphabetical; then ID.
                 def _t3_key(fid: int) -> Tuple[int, Tuple[int, str], str]:
                     p = feature_props[fid]
                     dist = _dist_num(p.get("Distribution Type"))  # 24, 48, 72...
                     letter = (p.get("Fiber Letter #1") or "").strip().upper()
 
-                    # Letter ranking matches your neighbor rules:
-                    # - If 24-count: B first, then A, then others
-                    # - Otherwise:  A first, then alphabetical
-                    if dist == 24:
-                        letter_rank = (0 if letter == "B" else (1 if letter == "A" else 2), letter)
-                    else:
-                        letter_rank = (0 if letter == "A" else 1, letter)
+                    # At T3: always prefer 'A' first (no special B>A for 24-count here)
+                    letter_rank = (0 if letter == "A" else 1, letter)
 
                     id_key = str(p.get("ID") or "")
-                    # NOTE: dist ascending → LOWER first (24→48→72)
-                    return (dist, letter_rank, id_key)
+                    # NOTE: -dist => HIGHER distribution first (72→48→24)
+                    return (-dist, letter_rank, id_key)
+
 
                 start_fids_ordered.extend(sorted(sec_to_fids[sn], key=_t3_key))
 
